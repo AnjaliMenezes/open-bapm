@@ -137,9 +137,10 @@ athlete_coef_rapm <- X_data |>
 athlete_summary |>                                                                                
   dplyr::inner_join(athlete_coef_rapm, by = "athlete_id") |>                                      
   dplyr::left_join(athlete, by = "athlete_id") |>                                                 
-  dplyr::filter(team_abbreviation == "LV") |>                                                     
-  dplyr::arrange(-coef) 
+  dplyr::arrange(-coef) |>
+  head(10) 
 
+plot(model_rapm)
 
 # things i played around with
 
@@ -147,23 +148,23 @@ box_totals <- wnba_player_box |>
   dplyr::group_by(athlete_id) |>                                                             
   dplyr::summarize(                                                                            
     box_minutes = sum(minutes, na.rm = TRUE),                                               
-    points      = sum(points, na.rm = TRUE),                                          
-    rebounds    = sum(rebounds, na.rm = TRUE),                                        
-    assists     = sum(assists, na.rm = TRUE),                                    
-    steals      = sum(steals, na.rm = TRUE),                                    
-    blocks      = sum(blocks, na.rm = TRUE),                                                       
-    turnovers   = sum(turnovers, na.rm = TRUE),                                                    
-    fg_missed   = sum(field_goals_attempted - field_goals_made, na.rm = TRUE),                     
-    ft_missed   = sum(free_throws_attempted - free_throws_made, na.rm = TRUE),                     
+    points = sum(points, na.rm = TRUE),                                          
+    rebounds = sum(rebounds, na.rm = TRUE),                                        
+    assists = sum(assists, na.rm = TRUE),                                    
+    steals = sum(steals, na.rm = TRUE),                                    
+    blocks = sum(blocks, na.rm = TRUE),                                                       
+    turnovers = sum(turnovers, na.rm = TRUE),                                                    
+    fg_missed = sum(field_goals_attempted - field_goals_made, na.rm = TRUE),                     
+    ft_missed = sum(free_throws_attempted - free_throws_made, na.rm = TRUE),                     
     .groups = "drop"                                                                            
   ) |>                                                                                            
   dplyr::filter(box_minutes > 0) |>                                                               
   dplyr::mutate(                                                                                  
-    pts_per40  = 40 * points    / box_minutes,                                                    
-    reb_per40  = 40 * rebounds  / box_minutes,                                                     
-    ast_per40  = 40 * assists   / box_minutes,                                                     
-    stl_per40  = 40 * steals    / box_minutes,                                                     
-    blk_per40  = 40 * blocks    / box_minutes,                                                     
+    pts_per40  = 40 * points / box_minutes,                                                    
+    reb_per40  = 40 * rebounds / box_minutes,                                                     
+    ast_per40  = 40 * assists / box_minutes,                                                     
+    stl_per40  = 40 * steals / box_minutes,                                                     
+    blk_per40  = 40 * blocks / box_minutes,                                                     
     tov_per40  = 40 * turnovers / box_minutes,                                                     
     miss_per40 = 40 * (fg_missed + ft_missed) / box_minutes                                        
   )                                                                                                
@@ -212,11 +213,6 @@ athlete_coef_rapm_prior <- X_data |>
   ) |>                                                                                               
   dplyr::select(athlete_id, prior, delta, coef)                                                      
 
-athlete_summary |>                                                                                  
-  dplyr::inner_join(athlete_coef_rapm_prior, by = "athlete_id") |>                                  
-  dplyr::left_join(athlete, by = "athlete_id") |>                                                   
-  dplyr::filter(team_abbreviation == "LV") |>                                                       
-  dplyr::arrange(-coef)                                                                              
 
 athlete_coef_rapm |>                                                         
   dplyr::rename(coef_rapm = coef) |>                                                                
@@ -226,17 +222,126 @@ athlete_coef_rapm |>
   ) |>                                                                                               
   dplyr::inner_join(athlete_summary, by = "athlete_id") |>                                          
   dplyr::left_join(athlete, by = "athlete_id") |>                                                   
-  dplyr::filter(team_abbreviation == "LV") |>                                                       
+  dplyr::filter(team_abbreviation == "DAL") |>                                                       
   dplyr::arrange(-coef_rapm_prior) |>                                                                
   dplyr::select(athlete_display_name, minutes, prior, coef_rapm, coef_rapm_prior) 
 
 
+athlete_coef_rapm |>                                                                                
+  dplyr::rename(coef_rapm = coef) |>                                                                
+  dplyr::inner_join(                                                                                
+    athlete_coef_rapm_prior |> dplyr::rename(coef_rapm_prior = coef),                               
+    by = "athlete_id"                                                                                
+  ) |>                                                                                              
+  dplyr::inner_join(athlete_summary, by = "athlete_id") |>                                          
+  dplyr::left_join(athlete, by = "athlete_id") |>                                                   
+  dplyr::arrange(-coef_rapm_prior) |>                                                                
+  dplyr::select(athlete_display_name, team_abbreviation, minutes, prior, coef_rapm, coef_rapm_prior) |> 
+  head(10)               
+
+# dont use raw plus minus in the prior
+# take prior and insert in final coef_rapm_prior to estimate at same time
+# regularize z
+
+# Edits after 09/17/26
+
+# List of the 7 box-score features that make up each player's z_p vector
+box_feature_names <- c("pts_per40", "reb_per40", "ast_per40",
+                       "stl_per40", "blk_per40", "tov_per40", "miss_per40")
 
 
+# one row per player, holding just their box-stat feature vector
+z_p <- box_totals |>
+  dplyr::select(athlete_id, dplyr::all_of(box_feature_names))
+
+z_p_matrix <- as.matrix(z_p[, box_feature_names])
+
+# Z_i = sum_{p in H_i} z_p - sum_{p in A_i} z_p', per stint, using the
+# same +1/-1 sign already computed in X_data$value
+Z_data <- X_data |>
+  dplyr::left_join(z_p, by = "athlete_id") |>
+  dplyr::mutate(dplyr::across(dplyr::all_of(box_feature_names), ~ dplyr::coalesce(.x, 0) * value)) |>
+  dplyr::group_by(row) |>
+  dplyr::summarize(dplyr::across(dplyr::all_of(box_feature_names), sum), .groups = "drop") |>
+  dplyr::arrange(row)
+
+# Z as a plain matrix: one row per stint, 7 columns = Z_i for that stint
+Z <- as.matrix(Z_data[, box_feature_names])
+
+# lineup dummies and box features combined into one design matrix,
+# so a single model can use both at once
+x_full <- Matrix::cbind2(x, Matrix::Matrix(Z, sparse = TRUE))
+
+# Single joint ridge fit: beta_adj (player residuals) and c (box
+# coefficients) are estimated together in one model, both are
+# penalized by the same lambda - this is the main edit that replaces the 
+# old two-stage lm() + offset approach
+model_joint <- glmnet::cv.glmnet(
+  x = x_full,
+  y = y,
+  weights = w,
+  alpha = 0,
+  standardize = FALSE
+)
+
+# Pull the fitted coefficients apart: first block = player deltas (beta_adj),
+# last block = box-stat coefficients (c)
+joint_coefs <- coef(model_joint, s = "lambda.min")[-1, 1]
+player_delta <- joint_coefs[seq_len(ncol(x))]
+c_coef <- joint_coefs[(ncol(x) + 1):length(joint_coefs)]
+names(c_coef) <- box_feature_names
+
+print(c_coef)
+
+# O_p = c^T z_p for each player: their box-score-implied prior rating,
+# computed using the c that was just estimated
+athlete_prior <- z_p |>
+  dplyr::mutate(prior_rating = as.numeric(z_p_matrix %*% c_coef)) |>
+  dplyr::select(athlete_id, prior_rating)
 
 
+# Final per-player table: attach beta_adj (by column order) and prior
+# (by athlete_id), then coef = prior + beta_adj (delta) is the final RAPM-with-prior rating
+athlete_coef_rapm_prior <- X_data |>
+  dplyr::distinct(column, athlete_id) |>
+  dplyr::arrange(column) |>
+  dplyr::mutate(delta = player_delta) |>
+  dplyr::left_join(athlete_prior, by = "athlete_id") |>
+  dplyr::mutate(
+    prior_rating = dplyr::coalesce(prior_rating, 0),
+    coef = prior_rating + delta
+  ) |>
+  dplyr::select(athlete_id, prior = prior_rating, delta, coef)
 
+# looking at dallas wings
+athlete_coef_rapm |>
+  dplyr::rename(coef_rapm = coef) |>
+  dplyr::inner_join(
+    athlete_coef_rapm_prior |> dplyr::rename(coef_rapm_prior = coef),
+    by = "athlete_id"
+  ) |>
+  dplyr::inner_join(athlete_summary, by = "athlete_id") |>
+  dplyr::left_join(athlete, by = "athlete_id") |>
+  dplyr::filter(team_abbreviation == "DAL") |>
+  dplyr::arrange(-coef_rapm_prior) |>
+  dplyr::select(athlete_display_name, minutes, prior, coef_rapm, coef_rapm_prior)
 
+# looking at top 10
+athlete_coef_rapm |>
+  dplyr::rename(coef_rapm = coef) |>
+  dplyr::inner_join(
+    athlete_coef_rapm_prior |> dplyr::rename(coef_rapm_prior = coef),
+    by = "athlete_id"
+  ) |>
+  dplyr::inner_join(athlete_summary, by = "athlete_id") |>
+  dplyr::left_join(athlete, by = "athlete_id") |>
+  dplyr::arrange(-coef_rapm_prior) |>
+  dplyr::select(athlete_display_name, team_abbreviation, minutes, prior, coef_rapm, coef_rapm_prior) |>
+  head(10)
+
+summary(athlete_coef_rapm_prior$delta)
+hist(athlete_coef_rapm_prior$delta, breaks = 30,
+     main = "Distribution of beta_adj across all players", xlab = "beta_adj")
 
 
 
