@@ -351,4 +351,5 @@ calculate_bapm <- function(pbp_data,
     model_rapm      = model_rapm,
     model_bapm      = model_joint
   )
+  head(bapm_results$athlete_ratings, 10)
 }
