@@ -16,9 +16,11 @@ wnba_player_box_2024 <- read.csv("input/data/wnba_player_box_2024.csv")
 starters <- wnba_player_box |>
   dplyr::filter(starter) |>
   dplyr::mutate(
-    score_diff_final = (1 - 2 * (home_away == "away")) * (team_score - opponent_team_score)
+    score_diff_final = (1 - 2 * (home_away == "away")) * (team_score - opponent_team_score),
+    pts_h_final = ifelse(home_away == "home", team_score, opponent_team_score),
+    pts_a_final = ifelse(home_away == "home", opponent_team_score, team_score)
   ) |>
-  dplyr::select(game_id, home_away, athlete_id, score_diff_final)
+  dplyr::select(game_id, home_away, athlete_id, score_diff_final, pts_h_final, pts_a_final)
 
 # elapsed game minutes; regulation quarters are 10 min, overtimes are 5 min
 elapsed_min <- function(qtr, clock_minutes, clock_seconds) {
@@ -32,13 +34,17 @@ substitutions <- wnba_pbp |>
   dplyr::mutate(
     time_start = elapsed_min(qtr, clock_minutes, clock_seconds),
     time_remaining = end_game_seconds_remaining / 60,
-    score_diff_start = home_score - away_score
+    score_diff_start = home_score - away_score,
+    pts_h_start = home_score,
+    pts_a_start = away_score
   ) |>
-  dplyr::select(game_id, time_start, time_remaining, score_diff_start, athlete_id_1, athlete_id_2)
+  dplyr::select(game_id, time_start, time_remaining, score_diff_start, pts_h_start, pts_a_start,
+                athlete_id_1, athlete_id_2)
 
 player_on <- starters |>
   dplyr::group_by(game_id, home_away) |>
-  dplyr::mutate(index = 1:dplyr::n(), time_start = 0, score_diff_start = 0, time_remaining = NA) |>
+  dplyr::mutate(index = 1:dplyr::n(), time_start = 0, score_diff_start = 0,
+                pts_h_start = 0, pts_a_start = 0, time_remaining = NA) |>
   dplyr::ungroup()
 
 for (i in 1:nrow(substitutions)) {
@@ -52,14 +58,17 @@ for (i in 1:nrow(substitutions)) {
       athlete_id = substitutions$athlete_id_1[i],
       time_start = substitutions$time_start[i],
       time_remaining = substitutions$time_remaining[i],
-      score_diff_start = substitutions$score_diff_start[i]
+      score_diff_start = substitutions$score_diff_start[i],
+      pts_h_start = substitutions$pts_h_start[i],
+      pts_a_start = substitutions$pts_a_start[i]
     )
   player_on <- dplyr::bind_rows(player_on, new_player_on)
 }
 
 player_on_collapsed <- player_on |>
   dplyr::group_by(
-    game_id, time_start, time_remaining, score_diff_start, score_diff_final, home_away, index
+    game_id, time_start, time_remaining, score_diff_start, score_diff_final,
+    pts_h_start, pts_a_start, pts_h_final, pts_a_final, home_away, index
   ) |>
   dplyr::summarize(athlete_id = athlete_id[dplyr::n()], .groups = "drop")
 
@@ -81,7 +90,10 @@ data <- lineups |>
   dplyr::group_by(game_id) |>
   dplyr::mutate(
     minutes = dplyr::coalesce(dplyr::lead(time_start, 1) - time_start, time_remaining),
-    score_diff = dplyr::coalesce(dplyr::lead(score_diff_start, 1), score_diff_final) - score_diff_start
+    score_diff = dplyr::coalesce(dplyr::lead(score_diff_start, 1), score_diff_final) - score_diff_start,
+    # points scored by each side during the stint (pts_h - pts_a == score_diff)
+    pts_h = dplyr::coalesce(dplyr::lead(pts_h_start, 1), pts_h_final) - pts_h_start,
+    pts_a = dplyr::coalesce(dplyr::lead(pts_a_start, 1), pts_a_final) - pts_a_start
   ) |>
   dplyr::ungroup() |>
   dplyr::filter(minutes > 0)
@@ -187,7 +199,8 @@ box <- box |>
   dplyr::left_join(team_poss, by = c("game_id", "team_id")) |>
   dplyr::mutate(
     poss_played = minutes / (team_min / 5) * game_poss,
-    miss = (field_goals_attempted - field_goals_made) + (free_throws_attempted - free_throws_made)
+    miss = (field_goals_attempted - field_goals_made) + (free_throws_attempted - free_throws_made),
+    dreb = rebounds - offensive_rebounds
   ) |>
   dplyr::arrange(athlete_id, game_date)
 
@@ -195,7 +208,15 @@ stat_cols <- c("points", "rebounds", "assists", "steals", "blocks", "turnovers",
 box_feature_names <- c("pts_per100", "reb_per100", "ast_per100",
                        "stl_per100", "blk_per100", "tov_per100", "miss_per100")
 
-roll_cols <- c(stat_cols, "poss_played")
+# Feature sets for the offense/defense split model (fit in its own section below).
+# Offensive stats feed the offensive prior; defensive stats feed the defensive prior.
+# Rebounds are split into offensive and defensive.
+off_stat_cols <- c("points", "assists", "turnovers", "miss", "offensive_rebounds")
+off_feature_names <- c("pts_per100", "ast_per100", "tov_per100", "miss_per100", "oreb_per100")
+def_stat_cols <- c("dreb", "steals", "blocks")
+def_feature_names <- c("dreb_per100", "stl_per100", "blk_per100")
+
+roll_cols <- unique(c(stat_cols, off_stat_cols, def_stat_cols, "poss_played"))
 
 # For each player-game: sum stats over that player's games in the window
 # [date - window_days, date - 1 day], a game never feeds its own prior
@@ -219,14 +240,15 @@ rate <- sapply(stat_cols, function(s) {
 })
 colnames(rate) <- box_feature_names
 
-# Standardize to z-scores
+# No standardization: the box features are the raw rolling per-100 rates.
+# League-average rates (from windows with enough possessions) fill players with no
+# games in the window, and are used to center the priors when reporting ratings.
 ok <- roll[, "poss_played"] >= min_poss_scale
 feat_mean <- colMeans(rate[ok, , drop = FALSE])
-feat_sd <- apply(rate[ok, , drop = FALSE], 2, sd)
-z_mat <- sweep(sweep(rate, 2, feat_mean, "-"), 2, feat_sd, "/")
-z_mat[is.na(z_mat)] <- 0
+box_mat <- rate
+for (j in seq_len(ncol(box_mat))) box_mat[is.na(box_mat[, j]), j] <- feat_mean[j]
 
-z_pg <- data.frame(game_id = box$game_id, athlete_id = box$athlete_id, z_mat, check.names = FALSE)
+z_pg <- data.frame(game_id = box$game_id, athlete_id = box$athlete_id, box_mat, check.names = FALSE)
 z_pg <- z_pg[!duplicated(z_pg[, c("game_id", "athlete_id")]), ]
 
 # stint level box matrix
@@ -257,7 +279,7 @@ fit_ridge <- function(xm, ym, wm, game_ids, nfolds = K_inner, penalty_factor = N
 }
 
 # BPM
-fit_bpm  <- function(Zm, ym, wm) lm.wfit(cbind(1, Zm), ym, wm)$coefficients
+fit_bpm <- function(Zm, ym, wm) lm.wfit(cbind(1, Zm), ym, wm)$coefficients
 pred_bpm <- function(coefs, Zm) as.numeric(cbind(1, Zm) %*% coefs)
 
 wrmse <- function(y, yhat, w) sqrt(weighted.mean((y - yhat)^2, w))
@@ -347,10 +369,13 @@ names(c_bpm) <- box_feature_names
 
 # Because the box prior now changes game to game, a player's prior is the
 # possession-weighted average of c' z_{p,g} over the stints they played
+# Features are raw rates, so center them at the league average to form the prior.
+# (The fit itself is unaffected: the constant cancels in home-minus-away.)
+Zc_long <- sweep(as.matrix(Z_long[, box_feature_names]), 2, feat_mean, "-")
 prior_by_player <- Z_long |>
   dplyr::mutate(
-    prior_bapm = as.numeric(as.matrix(Z_long[, box_feature_names]) %*% c_coef),
-    prior_bpm  = as.numeric(as.matrix(Z_long[, box_feature_names]) %*% c_bpm)
+    prior_bapm = as.numeric(Zc_long %*% c_coef),
+    prior_bpm  = as.numeric(Zc_long %*% c_bpm)
   ) |>
   dplyr::group_by(athlete_id) |>
   dplyr::summarize(
@@ -371,3 +396,211 @@ athlete_ratings <- players |>
 print(head(dplyr::arrange(athlete_ratings, -bapm), 10), digits = 3)
 
 print(dplyr::arrange(dplyr::filter(athlete_ratings, team_abbreviation == "DAL"), -bapm), digits = 3)
+print(dplyr::arrange(dplyr::filter(athlete_ratings, team_abbreviation == "LV"), -bapm), digits = 3)
+
+
+# ==============================================================================
+# OFFENSIVE / DEFENSIVE BAPM
+# ------------------------------------------------------------------------------
+# Same idea as BAPM, but every player gets two coefficients:
+#   o_p = offensive rating (points added per 100 possessions on offense)
+#   d_p = defensive rating (points prevented per 100 possessions on defense;
+#                           positive = good defense)
+# Each stint contributes two rows, one per offense:
+#   home on offense: y = 100 * home pts / poss,  + o_p (home players), - d_p (away players)
+#   away on offense: y = 100 * away pts / poss,  + o_p (away players), - d_p (home players)
+# so home-minus-away points per 100 = sum_home (o + d) - sum_away (o + d), and
+# o_p + d_p is directly comparable to the overall BAPM / RAPM coefficient.
+# Priors: o_p ~ c_off' x_off,p   (offensive box stats, raw per-100 rates)
+#         d_p ~ c_def' x_def,p   (defensive box stats, raw per-100 rates)
+# A (unpenalized) home-offense indicator plays the role the intercept plays in
+# the original model (home-court advantage)
+# ==============================================================================
+
+od_feature_names <- c(off_feature_names, def_feature_names)
+od_stat_cols <- c(off_stat_cols, def_stat_cols)
+
+# Raw rolling per-100 rates (no standardization; same recipe and `ok` filter as above)
+rate_od <- sapply(od_stat_cols, function(s) {
+  ifelse(roll[, "poss_played"] > 0, 100 * roll[, s] / roll[, "poss_played"], NA_real_)
+})
+colnames(rate_od) <- od_feature_names
+
+feat_mean_od <- colMeans(rate_od[ok, , drop = FALSE])
+box_mat_od <- rate_od
+for (j in seq_len(ncol(box_mat_od))) box_mat_od[is.na(box_mat_od[, j]), j] <- feat_mean_od[j]
+
+z_pg_od <- data.frame(game_id = box$game_id, athlete_id = box$athlete_id, box_mat_od, check.names = FALSE)
+z_pg_od <- z_pg_od[!duplicated(z_pg_od[, c("game_id", "athlete_id")]), ]
+
+# stint level box matrices, kept separately for the home and away players
+Z_long_od <- X_data |>
+  dplyr::left_join(z_pg_od, by = c("game_id", "athlete_id")) |>
+  dplyr::mutate(
+    dplyr::across(dplyr::all_of(od_feature_names), ~ dplyr::coalesce(.x, 0)),
+    side = ifelse(value == 1, "home", "away")
+  )
+
+Z_side <- Z_long_od |>
+  dplyr::group_by(row, side) |>
+  dplyr::summarize(dplyr::across(dplyr::all_of(od_feature_names), sum), .groups = "drop")
+
+Z_home <- Z_side |> dplyr::filter(side == "home") |> dplyr::arrange(row)
+Z_away <- Z_side |> dplyr::filter(side == "away") |> dplyr::arrange(row)
+
+n <- nrow(x)
+P <- ncol(x)
+stopifnot(nrow(Z_home) == n, nrow(Z_away) == n)
+
+# rows 1..n: home on offense; rows n+1..2n: away on offense
+# defensive box columns enter with a minus sign, matching the -d_p in the player columns
+Z_od <- rbind(
+  cbind(as.matrix(Z_home[, off_feature_names]), -as.matrix(Z_away[, def_feature_names])),
+  cbind(as.matrix(Z_away[, off_feature_names]), -as.matrix(Z_home[, def_feature_names]))
+)
+colnames(Z_od) <- od_feature_names
+
+# player indicator matrices for home and away players
+is_home <- X_data$value == 1
+XH <- Matrix::sparseMatrix(i = X_data$row[is_home], j = X_data$column[is_home],
+                           x = 1, dims = c(n, P))
+XA <- Matrix::sparseMatrix(i = X_data$row[!is_home], j = X_data$column[!is_home],
+                           x = 1, dims = c(n, P))
+
+# columns: [offense players | defense players | home-offense indicator]
+home_off <- c(rep(1, n), rep(0, n))
+x_od <- Matrix::rbind2(
+  Matrix::cbind2(XH, -XA),
+  Matrix::cbind2(XA, -XH)
+)
+x_od <- Matrix::cbind2(x_od, Matrix::Matrix(home_off, ncol = 1, sparse = TRUE))
+
+y_od <- c(100 * data$pts_h / data$poss, 100 * data$pts_a / data$poss)
+w_od <- c(w, w)
+gid_od <- c(data$game_id, data$game_id)
+
+stopifnot(nrow(Z_od) == nrow(x_od), length(y_od) == nrow(x_od), !anyNA(y_od))
+x_od_full <- Matrix::cbind2(x_od, Matrix::Matrix(Z_od, sparse = TRUE))
+# ridge on the player columns and box coefficients, no penalty on the home indicator
+pen_factor_od <- c(rep(1, 2 * P), 0, rep(c_penalty, ncol(Z_od)))
+
+# 10-fold CV
+oos_od <- rep(NA_real_, n)
+
+for (k in seq_len(K_outer)) {
+  te <- which(fold == k)
+  tr <- which(fold != k)
+  te_od <- c(te, te + n)
+  tr_od <- c(tr, tr + n)
+  
+  f_od <- fit_ridge(x_od_full[tr_od, , drop = FALSE], y_od[tr_od], w_od[tr_od], gid_od[tr_od],
+                    penalty_factor = pen_factor_od)
+  p_od <- as.numeric(predict(f_od, newx = x_od_full[te_od, , drop = FALSE], s = "lambda.min"))
+  oos_od[te] <- p_od[seq_along(te)] - p_od[length(te) + seq_along(te)]
+  
+  message("finished O/D fold ", k, " of ", K_outer)
+}
+
+fold_metrics_od <- do.call(rbind, lapply(seq_len(K_outer), function(k) {
+  te <- which(fold == k)
+  data.frame(fold = k, model = c("BAPM", "BAPM_OD"),
+             rmse = c(wrmse(y[te], oos[te, "BAPM"], w[te]), wrmse(y[te], oos_od[te], w[te])),
+             mae  = c(wmae(y[te], oos[te, "BAPM"], w[te]), wmae(y[te], oos_od[te], w[te])))
+}))
+
+cv_summary_od <- fold_metrics_od |>
+  dplyr::group_by(model) |>
+  dplyr::summarize(
+    rmse_se = sd(rmse) / sqrt(dplyr::n()), rmse = mean(rmse),
+    mae_se = sd(mae) / sqrt(dplyr::n()), mae = mean(mae),
+    .groups = "drop"
+  )
+
+skill_od <- c(BAPM = skill[["BAPM"]],
+              BAPM_OD = 1 - sum(w * (y - oos_od)^2) / sse_null)
+cv_summary_od$oos_skill_vs_null <- skill_od[cv_summary_od$model]
+
+cat("\nBAPM vs offense/defense BAPM (same folds, same scale)")
+print(as.data.frame(cv_summary_od), digits = 4)
+
+d_od <- fold_metrics_od$rmse[fold_metrics_od$model == "BAPM_OD"] -
+  fold_metrics_od$rmse[fold_metrics_od$model == "BAPM"]
+cat(sprintf("\nBAPM_OD - BAPM RMSE: mean %.4f, SE %.4f (negative favors BAPM_OD)\n",
+            mean(d_od), sd(d_od) / sqrt(length(d_od))))
+
+# --- Final fit on all data + offensive / defensive ratings per 100 possessions --
+model_od <- fit_ridge(x_od_full, y_od, w_od, gid_od, penalty_factor = pen_factor_od)
+
+joint_od <- coef(model_od, s = "lambda.min")[-1, 1]
+delta_off <- joint_od[seq_len(P)]
+delta_def <- joint_od[P + seq_len(P)]
+home_adv <- joint_od[2 * P + 1]
+c_od <- joint_od[(2 * P + 2):length(joint_od)]
+names(c_od) <- od_feature_names
+print(c_od)
+cat(sprintf("Home-offense indicator (pts per 100): %.3f\n", home_adv))
+
+c_off <- c_od[off_feature_names]
+c_def <- c_od[def_feature_names]
+
+# a player's prior is the possession-weighted average of c' z_{p,g} over their stints
+# (raw rates, so centered at the league average; the constant is absorbed by the intercept)
+Zc_off <- sweep(as.matrix(Z_long_od[, off_feature_names]), 2, feat_mean_od[off_feature_names], "-")
+Zc_def <- sweep(as.matrix(Z_long_od[, def_feature_names]), 2, feat_mean_od[def_feature_names], "-")
+prior_od_by_player <- Z_long_od |>
+  dplyr::mutate(
+    prior_off = as.numeric(Zc_off %*% c_off),
+    prior_def = as.numeric(Zc_def %*% c_def)
+  ) |>
+  dplyr::group_by(athlete_id) |>
+  dplyr::summarize(
+    prior_off = weighted.mean(prior_off, poss),
+    prior_def = weighted.mean(prior_def, poss),
+    .groups = "drop"
+  )
+
+# overall BAPM from the original model, for comparison (obapm + dbapm should be close)
+bapm_overall <- players |>
+  dplyr::mutate(delta = delta) |>
+  dplyr::left_join(prior_by_player, by = "athlete_id") |>
+  dplyr::transmute(athlete_id, bapm = prior_bapm + delta)
+
+athlete_ratings_od <- players |>
+  dplyr::mutate(delta_off = delta_off, delta_def = delta_def) |>
+  dplyr::left_join(prior_od_by_player, by = "athlete_id") |>
+  dplyr::mutate(
+    obapm = prior_off + delta_off,
+    dbapm = prior_def + delta_def,
+    bapm_od = obapm + dbapm
+  ) |>
+  dplyr::left_join(bapm_overall, by = "athlete_id") |>
+  dplyr::left_join(athlete_summary, by = "athlete_id") |>
+  dplyr::left_join(athlete, by = "athlete_id") |>
+  dplyr::select(athlete_display_name, team_abbreviation, minutes, poss,
+                prior_off, delta_off, obapm, prior_def, delta_def, dbapm, bapm_od, bapm)
+
+print(head(dplyr::arrange(athlete_ratings_od, -obapm), 10), digits = 3)
+print(head(dplyr::arrange(athlete_ratings_od, -dbapm), 10), digits = 3)
+print(head(dplyr::arrange(athlete_ratings_od, -bapm_od), 10), digits = 3)
+
+top10 <- function(df, col, min_poss = 500, n = 10) {
+  df |>
+    dplyr::filter(poss >= min_poss) |>
+    dplyr::arrange(dplyr::desc(.data[[col]])) |>
+    dplyr::slice_head(n = n) |>
+    dplyr::select(athlete_display_name, team_abbreviation, poss, obapm, dbapm, bapm_od, bapm)
+}
+
+cat("\nTop 10 offensive BAPM\n");   print(top10(athlete_ratings_od, "obapm"),   digits = 3)
+cat("\nTop 10 defensive BAPM\n");   print(top10(athlete_ratings_od, "dbapm"),   digits = 3)
+cat("\nTop 10 overall BAPM (O + D)\n"); print(top10(athlete_ratings_od, "bapm_od"), digits = 3)
+
+print(dplyr::arrange(dplyr::filter(athlete_ratings_od, team_abbreviation == "DAL"), -bapm_od), digits = 3)
+print(dplyr::arrange(dplyr::filter(athlete_ratings_od, team_abbreviation == "LV"), -bapm_od), digits = 3)
+
+cbind(c_bpm, c_coef)
+
+# how correlated are the features?
+round(cor(Z), 2)
+# do extreme block rates come from thin windows?
+plot(roll[, "poss_played"], box_mat[, "blk_per100"])
